@@ -1,6 +1,6 @@
 // Service worker: guarda la app en el celular para que abra sin señal.
 // Los datos NO pasan por acá: la app los guarda en el celular y los envía a Google cuando hay conexión.
-const CACHE = 'creper-v1.0.0';
+const CACHE = 'creper-v1.1.0';
 const SHELL = [
   './',
   './index.html',
@@ -14,7 +14,12 @@ const SHELL = [
 ];
 
 self.addEventListener('install', (event) => {
-  event.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));
+  // cache: 'reload' = baja los archivos recién publicados, no una copia vieja del navegador
+  event.waitUntil(
+    caches.open(CACHE)
+      .then((c) => c.addAll(SHELL.map((u) => new Request(u, { cache: 'reload' }))))
+      .then(() => self.skipWaiting())
+  );
 });
 
 self.addEventListener('activate', (event) => {
@@ -34,7 +39,7 @@ self.addEventListener('fetch', (event) => {
   event.respondWith((async () => {
     const cache = await caches.open(CACHE);
     const cached = await cache.match(req, { ignoreSearch: true });
-    const network = fetch(req)
+    const network = fetch(req.url, { cache: 'no-cache' })
       .then((res) => { if (res && res.ok) cache.put(req, res.clone()); return res; })
       .catch(() => null);
     if (cached) { event.waitUntil(network); return cached; }

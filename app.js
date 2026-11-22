@@ -3,14 +3,20 @@
  */
 'use strict';
 
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.1.0';
 const K = {
   cfg: 'creper.cfg', data: 'creper.data', queue: 'creper.queue', failed: 'creper.failed',
-  modo: 'creper.modo', drafts: 'creper.drafts', lastSync: 'creper.lastSync'
+  modo: 'creper.modo', drafts: 'creper.drafts', lastSync: 'creper.lastSync',
+  fecha: 'creper.fecha', descarga: 'creper.descarga'
 };
 const SUBE = '↗️', IGUAL = '⛔️', BAJA = '↘️';
 const ORIGEN_EXCEL = 'Excel original';
 const MEDICIONES = ['Peso y reps', 'Solo reps', 'Tiempo'];
+const MODOS = ['Normal', 'Molestia', 'Descarga'];
+const MODO_ICONO = { Normal: '', Molestia: '🩹', Descarga: '🔋' };
+const COMBOS = [['Titular', 'Normal'], ['Suplente', 'Normal'], ['Titular', 'Molestia'], ['Suplente', 'Molestia'], ['Titular', 'Descarga'], ['Suplente', 'Descarga']];
+const FECHA_TTL = 2 * 3600000; // una fecha pasada elegida se recuerda 2 h desde el último uso
+const DIAS_SEM = ['dom', 'lun', 'mar', 'mié', 'jue', 'vie', 'sáb'];
 const DAY_COLORS = ['#d93025', '#b45f06', '#674ea7', '#bf9000', '#85200c', '#1155cc', '#0b8043', '#c2185b', '#00838f', '#5d4037'];
 const EX_FIELDS = ['id', 'dia', 'orden', 'grupo', 'ejercicio', 'medicion', 'mejor', 'series', 'objetivo', 'suplente', 'ajuste', 'suplenteMolestia', 'incremento', 'activo', 'nota'];
 
@@ -32,9 +38,11 @@ const S = {
   server: load(K.data, { catalogo: [], historial: [] }),
   queue: load(K.queue, []),
   failed: load(K.failed, []),
-  modo: load(K.modo, 'Normal'),
+  modo: MODOS.includes(load(K.modo, 'Normal')) ? load(K.modo, 'Normal') : 'Normal',
   drafts: load(K.drafts, {}),
   lastSync: load(K.lastSync, 0),
+  fecha: load(K.fecha, null),
+  descargaPct: Number(load(K.descarga, 60)) || 60,
   sync: { running: false, error: null, retry: 0, timer: null },
   route: null
 };
@@ -52,6 +60,31 @@ function fmtDate(f, long) {
   if (!f) return '';
   const [y, m, d] = f.split('-');
   return long || y !== String(new Date().getFullYear()) ? `${d}/${m}/${y.slice(2)}` : `${d}/${m}`;
+}
+function fmtDia(f) {
+  if (!f) return '';
+  const [y, m, d] = f.split('-').map(Number);
+  return `${DIAS_SEM[new Date(y, m - 1, d).getDay()]} ${fmtDate(f)}`;
+}
+const esFecha = (v) => /^\d{4}-\d{2}-\d{2}$/.test(v || '');
+// "volver" solo acepta pantallas propias de la app
+const safeVolver = (v) => (typeof v === 'string' && /^#\/(dia|progreso|ej|ejercicios)(\/|\?|$)/.test(v) ? v : null);
+function ejUrl(exId, v, m, f, volver) {
+  return `#/ej/${enc(exId)}?v=${v}&m=${m}&f=${f}${volver ? '&volver=' + enc(volver) : ''}`;
+}
+
+/* Fecha del entrenamiento: se elige una vez (en la pantalla del día) y vale para todos los ejercicios */
+function fechaSesion() {
+  const f = S.fecha;
+  if (f && esFecha(f.f) && f.f < today() && Date.now() - (f.ts || 0) < FECHA_TTL) return f.f;
+  return today();
+}
+function setFechaSesion(f) {
+  S.fecha = esFecha(f) && f < today() ? { f, ts: Date.now() } : null;
+  store(K.fecha, S.fecha);
+}
+function tocarFechaSesion(f) {
+  if (S.fecha && S.fecha.f === f) { S.fecha.ts = Date.now(); store(K.fecha, S.fecha); }
 }
 function relDate(f) {
   const diff = Math.round((Date.parse(today()) - Date.parse(f)) / 86400000);
@@ -126,6 +159,24 @@ function ejecutado(ex, variante, modo) {
   return (modo === 'Molestia' && ex.suplenteMolestia) || ex.suplente || 'Suplente';
 }
 
+/* Semana de descarga: cargas al X% de la última sesión normal. Solo se reduce el peso (o las reps si no hay peso). */
+function escalarDescarga(ex, s, f) {
+  const out = { reps: num(s.reps), peso: num(s.peso), tiempo: num(s.tiempo) };
+  if (ex.medicion === 'Peso y reps' && out.peso !== null) out.peso = roundTo(out.peso * f, ex.incremento);
+  else if (ex.medicion === 'Solo reps' && out.reps !== null) out.reps = Math.max(1, Math.round(out.reps * f));
+  return out;
+}
+function baseDescarga(ex, variante, fecha) {
+  const pct = S.descargaPct / 100;
+  let base = lastEntry(ex.id, variante, 'Normal', fecha);
+  if (base) return { base, f: pct, desdeTitular: false };
+  if (variante === 'Suplente') {
+    base = lastEntry(ex.id, 'Titular', 'Normal', fecha);
+    if (base) return { base, f: pct * (1 + (Number(ex.ajuste) || 0) / 100), desdeTitular: true };
+  }
+  return null;
+}
+
 /* ---------------- vista combinada: datos del servidor + lo pendiente en el celular ---------------- */
 let cache = null;
 const invalidate = () => { cache = null; };
@@ -164,8 +215,10 @@ function buildView() {
       const ex = byId.get(e.exId) || normEx({ id: e.exId });
       const series = (e.series || []).map((s, i) => {
         const a = { reps: num(s.reps), peso: num(s.peso), tiempo: num(s.tiempo) };
-        const r = { ...a, tr: '', tc: '', igual: 1 };
-        if (e.origen === ORIGEN_EXCEL) { r.tr = s.tendReps || ''; r.tc = s.tendPeso || ''; r.igual = num(s.igual); }
+        const r = { ...a, tr: '', tc: '', igual: 1, excel: false };
+        // Series migradas del Excel (y no modificadas desde entonces): se respetan sus flechas y "sesiones igual"
+        const x = s.excel || ((s.origen || e.origen) === ORIGEN_EXCEL ? { tendReps: s.tendReps, tendPeso: s.tendPeso, igual: s.igual } : null);
+        if (x) { r.tr = x.tendReps || ''; r.tc = x.tendPeso || ''; r.igual = num(x.igual); r.excel = true; }
         else {
           const p = prev && prev.series[i];
           if (p) { const t = tend(ex, a, p); r.tr = t.reps; r.tc = t.carga; r.igual = t.igual ? (p.igual || 1) + 1 : 1; }
@@ -196,23 +249,21 @@ function lastEntry(exId, v, m, before) {
   return l.length ? l[l.length - 1] : null;
 }
 const entryOn = (exId, v, m, fecha) => entries(exId, v, m).find((e) => e.fecha === fecha) || null;
-const doneToday = (exId) => view().historial.some((e) => e.exId === exId && e.fecha === today());
+const doneOn = (exId, fecha) => view().historial.some((e) => e.exId === exId && e.fecha === fecha);
 
 /* ---------------- sincronización ---------------- */
 class ApiError extends Error { constructor(msg, kind) { super(msg); this.kind = kind; } }
 
-async function api(method, payload) {
+// Todo va por POST: la clave viaja dentro del mensaje, nunca en la dirección (URL).
+async function api(payload) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 25000);
   try {
-    let res;
-    if (method === 'GET') {
-      const q = new URLSearchParams({ ...payload, token: S.cfg.token, t: Date.now() });
-      res = await fetch(S.cfg.url + (S.cfg.url.includes('?') ? '&' : '?') + q, { signal: ctrl.signal, redirect: 'follow', cache: 'no-store' });
-    } else {
-      // text/plain evita el "preflight" CORS que Apps Script no admite
-      res = await fetch(S.cfg.url, { method: 'POST', body: JSON.stringify({ ...payload, token: S.cfg.token }), signal: ctrl.signal, redirect: 'follow' });
-    }
+    // text/plain evita el "preflight" CORS que Apps Script no admite
+    const res = await fetch(S.cfg.url, {
+      method: 'POST', body: JSON.stringify({ ...payload, token: S.cfg.token }),
+      signal: ctrl.signal, redirect: 'follow', cache: 'no-store'
+    });
     const text = await res.text();
     let json;
     try { json = JSON.parse(text); } catch (e) {
@@ -229,15 +280,20 @@ async function api(method, payload) {
   }
 }
 
-function enqueue(op) {
-  const prevQueue = S.queue;
-  if (op.type === 'entry' || op.type === 'deleteEntry') {
-    S.queue = S.queue.filter((o) => !((o.type === 'entry' || o.type === 'deleteEntry') && o.entrada === op.entrada));
-  } else if (op.type === 'exercise') {
-    S.queue = S.queue.filter((o) => !(o.type === 'exercise' && o.ex.id === op.ex.id));
-  }
-  S.queue.push(op);
-  if (!store(K.queue, S.queue)) { S.queue = prevQueue; return false; }
+// Agrega uno o varios cambios a la cola en un solo guardado (todo o nada).
+// Un cambio nuevo reemplaza a uno pendiente sobre el mismo registro o ejercicio.
+function enqueue(...ops) {
+  let q = S.queue;
+  ops.forEach((op) => {
+    if (op.type === 'entry' || op.type === 'deleteEntry') {
+      q = q.filter((o) => !((o.type === 'entry' || o.type === 'deleteEntry') && o.entrada === op.entrada));
+    } else if (op.type === 'exercise') {
+      q = q.filter((o) => !(o.type === 'exercise' && o.ex.id === op.ex.id));
+    }
+    q = [...q, op];
+  });
+  if (!store(K.queue, q)) return false;
+  S.queue = q;
   invalidate();
   return true;
 }
@@ -252,7 +308,7 @@ async function sync() {
     let vueltas = 0;
     do {
       const batch = S.queue.slice(0, 30);
-      const res = batch.length ? await api('POST', { action: 'sync', ops: batch }) : await api('GET', { action: 'bootstrap' });
+      const res = await api(batch.length ? { action: 'sync', ops: batch } : { action: 'bootstrap', ops: [] });
       if (batch.length) {
         const done = new Set(res.done || []);
         (res.failed || []).forEach((f) => {
@@ -302,16 +358,29 @@ function updatePill() { const el = document.getElementById('sync'); if (el) el.o
 
 /* ---------------- piezas de interfaz ---------------- */
 function topbar(title, back, right) {
-  return `<header class="bar">${back ? `<a class="icon-btn" href="${back}" aria-label="Volver">‹</a>` : ''}<h1>${esc(title)}</h1>${right || ''}</header>`;
+  return `<header class="bar">${back ? `<a class="icon-btn" href="${esc(back)}" aria-label="Volver">‹</a>` : ''}<h1>${esc(title)}</h1>${right || ''}</header>`;
 }
 function nav(active) {
   const items = [['', '🏋️', 'Entrenar'], ['progreso', '📈', 'Progreso'], ['ejercicios', '🗂️', 'Ejercicios'], ['ajustes', '⚙️', 'Ajustes']];
   return `<nav class="nav">${items.map(([r, i, t]) => `<a href="#/${r}" class="${active === r ? 'on' : ''}"><span>${i}</span>${t}</a>`).join('')}</nav>`;
 }
-function modoSeg(actual, act, extra) {
-  return `<div class="seg" role="group" aria-label="Modo">
-    <button class="${actual === 'Normal' ? 'on' : ''}" data-act="${act}" data-v="Normal" ${extra || ''}>Normal</button>
-    <button class="${actual === 'Molestia' ? 'on molestia' : ''}" data-act="${act}" data-v="Molestia" ${extra || ''}>🩹 Con molestia</button>
+function modoSeg(actual, act) {
+  const b = (v, txt, cls) => `<button class="${actual === v ? 'on ' + cls : ''}" data-act="${act}" data-v="${v}">${txt}</button>`;
+  return `<div class="seg modos" role="group" aria-label="Modo">${b('Normal', 'Normal', '')}${b('Molestia', '🩹 Molestia', 'molestia')}${b('Descarga', '🔋 Descarga', 'descarga')}</div>`;
+}
+const modoClase = (m) => (m === 'Molestia' ? 'molestia' : m === 'Descarga' ? 'descarga' : '');
+const modoTxt = (m) => (m === 'Normal' ? 'normal' : m === 'Molestia' ? 'con molestia 🩹' : 'en descarga 🔋');
+function bannerModo(modo) {
+  if (modo === 'Molestia') return '<div class="banner molestia">🩹 Modo molestia: verás y guardarás las cargas reducidas, separadas de tu progreso normal.</div>';
+  if (modo === 'Descarga') return `<div class="banner descarga">🔋 Semana de descarga: tus pesos se precargan al ${S.descargaPct}% de lo normal y lo que guardes no cuenta en tu progreso. Al terminar la semana, vuelve a Normal.</div>`;
+  return '';
+}
+function fechaBar(fecha) {
+  const hoy = fecha === today();
+  return `<div class="fecha-bar${hoy ? '' : ' pasada'}">
+    <label for="fechaSesion">${hoy ? '📅 Entrenamiento de <b>hoy</b>' : `⚠️ Entrenamiento del <b>${fmtDia(fecha)}</b> (no es hoy)`}</label>
+    <input id="fechaSesion" type="date" value="${fecha}" max="${today()}">
+    ${hoy ? '' : '<button class="btn small" data-act="fechaHoy">Volver a hoy</button>'}
   </div>`;
 }
 function chipsHtml(ex, e, conFlechas) {
@@ -331,6 +400,8 @@ function viewHome() {
       <p class="sub">Pega la URL de la aplicación web y la clave (las sacas de Apps Script y de la pestaña Configuración de tu hoja).</p>
       <a class="btn primary block" href="#/ajustes">Configurar conexión</a></div>`;
   }
+  const fecha = fechaSesion();
+  const esHoy = fecha === today();
   if (!V.days.length) {
     body += `<div class="empty">${S.cfg.url ? 'Todavía no hay ejercicios. Toca el indicador de arriba para traerlos de tu hoja, o crea uno en 🗂️ Ejercicios.' : ''}</div>`;
   } else {
@@ -339,52 +410,90 @@ function viewHome() {
       const ids = new Set(exs.map((e) => e.id));
       const fechas = V.historial.filter((e) => ids.has(e.exId)).map((e) => e.fecha).sort();
       const ultima = fechas.length ? fechas[fechas.length - 1] : null;
-      const hechos = exs.filter((e) => doneToday(e.id)).length;
+      const hechos = exs.filter((e) => doneOn(e.id, fecha)).length;
       return `<a class="card day" style="--c:${dayColor(d)}" href="#/dia/${enc(d)}">
-        <div class="row"><div class="title">${esc(d)}</div><span class="spacer"></span>${hechos ? `<span class="badge ok">${hechos}/${exs.length} hoy</span>` : ''}</div>
+        <div class="row"><div class="title">${esc(d)}</div><span class="spacer"></span>${hechos ? `<span class="badge ok">${hechos}/${exs.length} ${esHoy ? 'hoy' : fmtDate(fecha)}</span>` : ''}</div>
         <div class="sub">${exs.length} ejercicio${exs.length === 1 ? '' : 's'}${ultima ? ` · última vez ${relDate(ultima)}` : ''}</div>
         ${hechos ? `<div class="progress"><i style="width:${Math.round((hechos / exs.length) * 100)}%"></i></div>` : ''}
       </a>`;
     }).join('');
   }
+  const avisoFecha = esHoy ? '' : `<div class="banner warn row"><span class="grow">📅 Estás cargando el entrenamiento del <b>${fmtDia(fecha)}</b>.</span><button class="btn small" data-act="fechaHoy">Volver a hoy</button></div>`;
   return topbar('Registro CrePer') + `<div class="wrap stack">${pillHtml()}${modoSeg(S.modo, 'modoGlobal')}
-    ${S.modo === 'Molestia' ? '<div class="banner molestia">🩹 Modo molestia: verás y guardarás las cargas reducidas, separadas de tu progreso normal.</div>' : ''}
+    ${bannerModo(S.modo)}${avisoFecha}
     ${body}</div>` + nav('');
 }
 
 function viewDia(dia) {
   const exs = exercisesOf(dia);
   if (!exs.length) return topbar(dia, '#/') + `<div class="empty">No hay ejercicios activos en este día.</div>` + nav('');
-  const hechos = exs.filter((e) => doneToday(e.id)).length;
+  const fecha = fechaSesion();
+  const esHoy = fecha === today();
+  const modo = S.modo;
+  const hechos = exs.filter((e) => doneOn(e.id, fecha)).length;
   const cards = exs.map((ex) => {
-    const hoy = entryOn(ex.id, 'Titular', S.modo, today()) || entryOn(ex.id, 'Suplente', S.modo, today());
-    const hoyOtro = hoy || view().historial.find((e) => e.exId === ex.id && e.fecha === today());
-    let ref = hoy || lastEntry(ex.id, 'Titular', S.modo) || lastEntry(ex.id, 'Suplente', S.modo);
-    let deNormal = false;
-    if (!ref && S.modo === 'Molestia') { ref = lastEntry(ex.id, 'Titular', 'Normal'); deNormal = !!ref; }
-    const est = maxIgual(lastEntry(ex.id, 'Titular', S.modo, hoy ? today() : null));
+    const hoy = entryOn(ex.id, 'Titular', modo, fecha) || entryOn(ex.id, 'Suplente', modo, fecha);
+    const hoyOtro = hoy || view().historial.find((e) => e.exId === ex.id && e.fecha === fecha);
+    // Qué series mostrar: lo cargado en esa fecha o, si no hay, la referencia para hoy
+    let chips = null;
+    let txt = '';
+    if (hoy) {
+      chips = hoy;
+      txt = (esHoy ? 'Hoy' : fmtDia(fecha)) + (hoy.variante === 'Suplente' ? ' · suplente' : '');
+    } else if (modo === 'Descarga') {
+      const bd = baseDescarga(ex, 'Titular', fecha);
+      if (bd) {
+        chips = { series: bd.base.series.map((s) => escalarDescarga(ex, s, bd.f)) };
+        txt = ex.medicion === 'Tiempo' ? `Tu última sesión normal (${relDate(bd.base.fecha)})` : `Al ${S.descargaPct}% de tu última sesión normal (${relDate(bd.base.fecha)})`;
+      } else {
+        const pd = lastEntry(ex.id, 'Titular', 'Descarga', fecha) || lastEntry(ex.id, 'Suplente', 'Descarga', fecha);
+        if (pd) { chips = pd; txt = 'Última descarga: ' + relDate(pd.fecha); }
+      }
+    } else {
+      const ref = lastEntry(ex.id, 'Titular', modo, fecha) || lastEntry(ex.id, 'Suplente', modo, fecha);
+      if (ref) {
+        chips = ref;
+        txt = 'Última: ' + relDate(ref.fecha) + (ref.variante === 'Suplente' ? ' · suplente' : '');
+      } else if (modo === 'Molestia') {
+        const n = lastEntry(ex.id, 'Titular', 'Normal', fecha);
+        if (n) { chips = n; txt = 'Sin datos con molestia · cargas normales (' + relDate(n.fecha) + ')'; }
+      }
+    }
+    const est = hoy || modo === 'Descarga' ? 0 : maxIgual(lastEntry(ex.id, 'Titular', modo, fecha));
     const sub = [ex.grupo, ex.suplente ? `Suplente: ${ex.suplente}` : '', ex.medicion !== 'Peso y reps' ? ex.medicion : ''].filter(Boolean).join(' · ');
     const badgeHoy = hoyOtro
-      ? `<span class="badge ok">✓ Hoy${hoyOtro.variante === 'Suplente' ? ' (suplente)' : ''}${hoyOtro.modo !== S.modo ? (hoyOtro.modo === 'Molestia' ? ' 🩹' : ' (normal)') : ''}${hoyOtro.pendiente ? ' ⏳' : ''}</span>`
+      ? `<span class="badge ok">✓ ${esHoy ? 'Hoy' : 'Cargado'}${hoyOtro.variante === 'Suplente' ? ' (suplente)' : ''}${hoyOtro.modo !== modo ? (hoyOtro.modo === 'Normal' ? ' (normal)' : ' ' + MODO_ICONO[hoyOtro.modo]) : ''}${hoyOtro.pendiente ? ' ⏳' : ''}</span>`
       : '';
-    return `<a class="card ex" style="--c:${dayColor(dia)}" href="#/ej/${enc(ex.id)}?m=${S.modo}">
+    return `<a class="card ex" style="--c:${dayColor(dia)}" href="${esc(ejUrl(ex.id, 'Titular', modo, fecha))}">
       <div class="row"><div class="title">${esc(ex.ejercicio)}</div><span class="spacer"></span>${badgeHoy}</div>
       <div class="sub">${esc(sub)}</div>
-      ${ref ? chipsHtml(ex, ref, false) : '<div class="sub">Sin registros todavía</div>'}
-      <div class="row small" style="margin-top:6px">${ref ? `<span class="muted">${deNormal ? 'Sin datos con molestia · cargas normales (' + relDate(ref.fecha) + ')' : hoy ? 'Hoy' : 'Última: ' + relDate(ref.fecha)}${ref.variante === 'Suplente' ? ' · suplente' : ''}</span>` : ''}
-        ${est >= 3 && !hoy ? `<span class="badge warn">🔁 ${est} sesiones igual</span>` : ''}</div>
+      ${chips ? chipsHtml(ex, chips, false) : '<div class="sub">Sin registros todavía</div>'}
+      <div class="row small" style="margin-top:6px">${txt ? `<span class="muted">${esc(txt)}</span>` : ''}
+        ${est >= 3 ? `<span class="badge warn">🔁 ${est} sesiones igual</span>` : ''}</div>
     </a>`;
   }).join('');
-  return topbar(dia, '#/') + `<div class="wrap stack">${pillHtml()}${modoSeg(S.modo, 'modoGlobal')}
-    <div class="row small muted">Hoy: ${hechos} de ${exs.length} ejercicios</div>
+  return topbar(dia, '#/') + `<div class="wrap stack">${pillHtml()}${modoSeg(modo, 'modoGlobal')}
+    ${modo === 'Normal' ? '' : bannerModo(modo)}
+    ${fechaBar(fecha)}
+    <div class="row small muted">${esHoy ? 'Hoy' : fmtDia(fecha)}: ${hechos} de ${exs.length} ejercicios</div>
     <div class="progress" style="margin-top:4px"><i style="width:${Math.round((hechos / exs.length) * 100)}%"></i></div>
     ${cards}</div>` + nav('');
 }
 
 function prefill(ex, variante, modo, fecha) {
   const toForm = (s) => ({ reps: inNum(s.reps), peso: inNum(s.peso), tiempo: s.tiempo === null || s.tiempo === undefined ? '' : String(s.tiempo) });
-  const ref = lastEntry(ex.id, variante, modo, fecha);
   const hoy = entryOn(ex.id, variante, modo, fecha);
+  if (modo === 'Descarga') {
+    // En descarga no se compara con la sesión anterior: se muestra la referencia normal
+    const bd = baseDescarga(ex, variante, fecha);
+    const normalRef = bd ? bd.base : null;
+    if (hoy) return { series: hoy.series.map(toForm), nota: hoy.nota || '', ref: null, normalRef, fuente: 'editando', existing: hoy };
+    if (bd) return { series: bd.base.series.map((s) => toForm(escalarDescarga(ex, s, bd.f))), nota: '', ref: null, normalRef, fuente: 'descarga', desdeTitular: bd.desdeTitular };
+    const pd = lastEntry(ex.id, variante, 'Descarga', fecha);
+    if (pd) return { series: pd.series.map(toForm), nota: '', ref: null, normalRef: null, fuente: 'ultimaDescarga' };
+    return { series: Array.from({ length: ex.series }, () => ({ reps: '', peso: '', tiempo: '' })), nota: '', ref: null, fuente: 'nuevo' };
+  }
+  const ref = lastEntry(ex.id, variante, modo, fecha);
   if (hoy) return { series: hoy.series.map(toForm), nota: hoy.nota || '', ref, fuente: 'editando', existing: hoy };
   if (ref) return { series: ref.series.map(toForm), nota: '', ref, fuente: 'ultima' };
   if (variante === 'Suplente') {
@@ -411,7 +520,9 @@ function initForm(ex, variante, modo, fecha) {
   return {
     exId: ex.id, variante, modo, fecha, entrada,
     series: d ? d.series.map((s) => ({ ...s })) : p.series, nota: d ? d.nota : p.nota,
-    ref: p.ref, fuente: p.fuente, existing: p.existing || null, fromDraft: !!d
+    ref: p.ref, normalRef: p.normalRef || null, desdeTitular: !!p.desdeTitular,
+    fuente: p.fuente, existing: p.existing || null, fromDraft: !!d,
+    nuevaFecha: null, addSup: false, supNombre: '', supAjuste: '', volver: null
   };
 }
 function saveDraft() {
@@ -425,6 +536,10 @@ function fieldsFor(ex) {
   return [['reps', 'Reps'], ['peso', 'Kg']];
 }
 function indHtml(ex, i) {
+  if (F.modo === 'Descarga') {
+    const n = F.normalRef && F.normalRef.series[i];
+    return n ? `<span class="muted">${F.desdeTitular ? 'titular normal' : 'normal'}: ${esc(setTxt(ex, n))}</span>` : '';
+  }
   const s = F.series[i];
   const a = { reps: num(s.reps), peso: num(s.peso), tiempo: num(s.tiempo) };
   const p = F.ref && F.ref.series[i];
@@ -442,21 +557,50 @@ function viewEj(id, q) {
   const V = view();
   const ex = V.byId.get(id);
   if (!ex) return topbar('Ejercicio', '#/') + '<div class="empty">No encontré este ejercicio.</div>';
-  const variante = q.get('v') === 'Suplente' && ex.suplente ? 'Suplente' : 'Titular';
-  const modo = q.get('m') === 'Molestia' ? 'Molestia' : q.get('m') === 'Normal' ? 'Normal' : S.modo;
-  const fecha = /^\d{4}-\d{2}-\d{2}$/.test(q.get('f') || '') ? q.get('f') : today();
+  const modo = MODOS.includes(q.get('m')) ? q.get('m') : S.modo;
+  const fecha = esFecha(q.get('f')) ? q.get('f') : fechaSesion();
+  const variante = q.get('v') === 'Suplente' && (ex.suplente || entryOn(ex.id, 'Suplente', modo, fecha)) ? 'Suplente' : 'Titular';
+  const volver = safeVolver(q.get('volver'));
   const entrada = `${fecha}|${ex.id}|${variante}|${modo}`;
   if (!F || F.entrada !== entrada) F = initForm(ex, variante, modo, fecha);
-  const url = (v, m, f) => `#/ej/${enc(id)}?v=${v}&m=${m}&f=${f}`;
+  F.volver = volver;
+  const url = (v, m, f) => ejUrl(id, v, m, f, volver);
 
+  const pctTxt = F.desdeTitular ? `${S.descargaPct}% de tu última sesión normal del titular (+${ex.ajuste || 0}% por ser suplente)` : `${S.descargaPct}% de tu última sesión normal`;
   const fuente = {
-    editando: `✏️ Estás editando lo que guardaste el ${fmtDate(fecha, true)}.`,
+    editando: `✏️ Estás editando lo que guardaste el ${fmtDia(fecha)}.`,
     ultima: F.ref ? `Precargado con tu última vez (${relDate(F.ref.fecha)}). Cambia lo que hiciste distinto.` : '',
     ajuste: `Primera vez con el suplente: pesos sugeridos = titular +${ex.ajuste}%. Ajústalos si hace falta.`,
     titular: 'Primera vez con el suplente: se copiaron los valores del titular. Ajústalos.',
     normal: 'Sin registros con molestia: se copiaron tus cargas normales. Bájalas según te indicó tu entrenador.',
+    descarga: ex.medicion === 'Tiempo' ? '🔋 Semana de descarga: se copiaron los tiempos de tu última sesión normal.'
+      : `🔋 Semana de descarga: ${ex.medicion === 'Solo reps' ? 'reps' : 'pesos'} al ${pctTxt}. Ajústalos si tu entrenador te indicó otra cosa.`,
+    ultimaDescarga: '🔋 Sin sesiones normales para calcular: se copió tu última descarga.',
     nuevo: 'Primera vez: carga tus series.'
   }[F.fuente];
+
+  // Fecha: un registro nuevo usa la del entrenamiento; uno ya guardado se puede mover a otra fecha
+  const fechaHtml = F.existing
+    ? `<div><label class="small muted" for="fecha">📅 Fecha de este registro</label>
+        <input id="fecha" type="date" value="${F.nuevaFecha || fecha}" max="${today()}">
+        <div class="small muted" id="fecha-help" style="margin-top:4px">${fechaHelp(fecha)}</div></div>`
+    : `<div class="fecha-ej${fecha === today() ? '' : ' pasada'}">📅 ${fecha === today() ? 'Hoy, ' + fmtDia(fecha) : `Entrenamiento del ${fmtDia(fecha)} (no es hoy)`}</div>`;
+
+  const supHtml = ex.suplente || ex.medicion === 'Tiempo' ? '' : F.addSup
+    ? `<div class="card form">
+        <div class="title" style="font-size:16px">Agregar suplente</div>
+        <label class="lbl" for="sup-nombre">Ejercicio suplente</label>
+        <input id="sup-nombre" type="text" autocomplete="off" placeholder="Ej.: Hack 2" value="${esc(F.supNombre)}">
+        <label class="lbl" for="sup-ajuste">¿Cuánto % más de peso que el titular? (opcional)</label>
+        <input id="sup-ajuste" type="text" inputmode="numeric" placeholder="Ej.: 20" value="${esc(F.supAjuste)}">
+        <div class="help">Se usa para sugerirte el peso la primera vez que hagas el suplente.</div>
+        <div class="row" style="margin-top:12px"><button class="btn small" data-act="cancelSup">Cancelar</button><button class="btn small primary" data-act="saveSup">Guardar suplente</button></div>
+      </div>`
+    : '<button class="linkbtn plain" data-act="addSup">+ Agregar suplente (por si la máquina está ocupada)</button>';
+
+  const refLinea = modo === 'Descarga'
+    ? (F.normalRef ? `<div class="small muted">Última normal${F.desdeTitular ? ' del titular' : ''} (${fmtDate(F.normalRef.fecha)}): ${F.normalRef.series.map((s) => esc(setTxt(ex, s))).join(' · ')}</div>` : '')
+    : (F.ref ? `<div class="small muted">Última vez (${fmtDate(F.ref.fecha)}): ${F.ref.series.map((s) => esc(setTxt(ex, s))).join(' · ')}</div>` : '');
 
   const campos = fieldsFor(ex);
   const series = F.series.map((s, i) => `
@@ -476,25 +620,35 @@ function viewEj(id, q) {
     </div>`).join('');
 
   const info = [ex.objetivo ? `🎯 ${esc(ex.objetivo)}` : '', ex.nota ? esc(ex.nota) : ''].filter(Boolean).join(' · ');
-  document.body.classList.toggle('molestia', modo === 'Molestia');
-  return topbar(ex.ejercicio, `#/dia/${enc(ex.dia)}`) + `<div class="wrap stack">
+  document.body.classList.remove('molestia', 'descarga');
+  if (modoClase(modo)) document.body.classList.add(modoClase(modo));
+  return topbar(ex.ejercicio, volver || `#/dia/${enc(ex.dia)}`) + `<div class="wrap stack">
     <div class="small muted">${esc(ex.grupo)}${info ? ' · ' + info : ''}</div>
-    ${ex.suplente ? `<div class="seg" role="group" aria-label="Variante">
-      <button class="${variante === 'Titular' ? 'on' : ''}" data-act="go" data-url="${url('Titular', modo, fecha)}">Titular<small>${esc(ex.ejercicio)}</small></button>
-      <button class="${variante === 'Suplente' ? 'on' : ''}" data-act="go" data-url="${url('Suplente', modo, fecha)}">Suplente<small>${esc(ejecutado(ex, 'Suplente', modo))}</small></button>
+    ${ex.suplente || variante === 'Suplente' ? `<div class="seg" role="group" aria-label="Variante">
+      <button class="${variante === 'Titular' ? 'on' : ''}" data-act="go" data-url="${esc(url('Titular', modo, fecha))}">Titular<small>${esc(ex.ejercicio)}</small></button>
+      <button class="${variante === 'Suplente' ? 'on' : ''}" data-act="go" data-url="${esc(url('Suplente', modo, fecha))}">Suplente<small>${esc(ejecutado(ex, 'Suplente', modo))}</small></button>
     </div>` : ''}
+    ${supHtml}
     ${modoSeg(modo, 'modoEj')}
-    <div class="row"><label for="fecha" class="small muted">Fecha</label><input id="fecha" type="date" value="${fecha}" max="${today()}" style="flex:1"></div>
+    ${fechaHtml}
     ${F.fromDraft ? '<div class="banner warn">Recuperé lo que estabas cargando y no habías guardado. <button class="linkbtn" data-act="discardDraft">Descartar</button></div>' : ''}
-    ${fuente ? `<div class="banner info">${fuente}</div>` : ''}
-    ${F.ref ? `<div class="small muted">Última vez (${fmtDate(F.ref.fecha)}): ${F.ref.series.map((s) => esc(setTxt(ex, s))).join(' · ')}</div>` : ''}
+    ${fuente ? `<div class="banner ${F.fuente === 'descarga' || F.fuente === 'ultimaDescarga' ? 'descarga' : 'info'}">${fuente}</div>` : ''}
+    ${refLinea}
     ${series}
     <div class="row"><button class="btn small" data-act="addSerie">+ Serie</button><button class="btn small" data-act="delSerie" ${F.series.length <= 1 ? 'disabled' : ''}>− Quitar última</button></div>
     <label class="small muted" for="nota">Nota (opcional)</label>
     <textarea id="nota" placeholder="Ej.: la máquina estaba ocupada, molestia en la rodilla…">${esc(F.nota)}</textarea>
-    ${F.existing ? '<button class="linkbtn" data-act="delEntry">Eliminar este registro</button>' : ''}
+    <div class="row">
+      ${F.existing ? '<button class="linkbtn" data-act="delEntry">Eliminar este registro</button><span class="spacer"></span>' : ''}
+      <a class="linkbtn plain" href="#/editar/${enc(ex.id)}?volver=${enc(location.hash)}">✏️ Editar ejercicio</a>
+    </div>
   </div>
-  <div class="footer-bar"><div><button class="btn primary block" data-act="saveEj">${F.existing ? 'Guardar cambios' : 'Guardar'}</button></div></div>`;
+  <div class="footer-bar"><div><button class="btn primary block" data-act="saveEj">${F.existing ? (F.nuevaFecha && F.nuevaFecha !== fecha ? 'Guardar y mover' : 'Guardar cambios') : 'Guardar'}</button></div></div>`;
+}
+
+function fechaHelp(fecha) {
+  if (F && F.nuevaFecha && F.nuevaFecha !== fecha) return `Al guardar, este registro <b>se mueve</b> del ${fmtDia(fecha)} al <b>${fmtDia(F.nuevaFecha)}</b> (no se duplica).`;
+  return 'Si te equivocaste de día, cámbiala acá: el registro se mueve, no se duplica.';
 }
 
 function metricsFor(ex) {
@@ -557,7 +711,7 @@ function viewProgreso() {
       const mejor = m.invert ? b < a : b > a;
       cambio = b === a ? '<span class="muted">=</span>' : `<span class="${mejor ? 'up' : 'down'}">${mejor ? '▲' : '▼'} ${esc(m.fmt(a))} → ${esc(m.fmt(b))}</span>`;
     }
-    const total = ['Titular|Normal', 'Suplente|Normal', 'Titular|Molestia', 'Suplente|Molestia'].reduce((n, vm) => n + (V.byKey.get(`${ex.id}|${vm}`) || []).length, 0);
+    const total = COMBOS.reduce((n, [cv, cm]) => n + entries(ex.id, cv, cm).length, 0);
     return `<a href="#/progreso/${enc(ex.id)}"><div class="grow"><div class="name">${esc(ex.ejercicio)}</div>
       <div class="small muted">${total} sesión(es)${l.length ? ' · última ' + relDate(l[l.length - 1].fecha) : ''}</div></div><div class="small">${cambio}</div></a>`;
   }).join('')}</div>`).join('');
@@ -568,8 +722,7 @@ function viewProgresoEj(id, q) {
   const V = view();
   const ex = V.byId.get(id);
   if (!ex) return topbar('Progreso', '#/progreso') + '<div class="empty">No encontré este ejercicio.</div>' + nav('progreso');
-  const combos = [['Titular', 'Normal'], ['Suplente', 'Normal'], ['Titular', 'Molestia'], ['Suplente', 'Molestia']]
-    .filter(([v, m]) => entries(id, v, m).length);
+  const combos = COMBOS.filter(([v, m]) => entries(id, v, m).length);
   if (!combos.length) return topbar(ex.ejercicio, '#/progreso') + '<div class="empty">Sin sesiones todavía.</div>' + nav('progreso');
   let v = q.get('v'), m = q.get('m');
   if (!combos.some((c) => c[0] === v && c[1] === m)) [v, m] = combos[0];
@@ -591,8 +744,9 @@ function viewProgresoEj(id, q) {
     </div>`;
   }
   const last = list[list.length - 1];
-  const est = last ? last.series.map((s, i) => (s.igual >= 2 ? `serie ${i + 1}: ${s.igual}` : '')).filter(Boolean) : [];
-  const etiquetaCombo = (c) => `${c[0] === 'Titular' ? 'Titular' : 'Suplente'}${c[1] === 'Molestia' ? ' 🩹' : ''}`;
+  const est = last && m !== 'Descarga' ? last.series.map((s, i) => (s.igual >= 2 ? `serie ${i + 1}: ${s.igual}` : '')).filter(Boolean) : [];
+  const etiquetaCombo = (c) => `${c[0]}${MODO_ICONO[c[1]] ? ' ' + MODO_ICONO[c[1]] : ''}`;
+  const aqui = url(v, m, met.k);
   return topbar(ex.ejercicio, '#/progreso') + `<div class="wrap stack">
     <div class="small muted">${esc(ex.dia)} · ${esc(ex.grupo)}</div>
     ${combos.length > 1 ? `<div class="seg${combos.length > 2 ? ' grid2' : ''}">${combos.map((c) => `<a class="${c[0] === v && c[1] === m ? 'on' : ''}" href="${url(c[0], c[1], met.k)}">${etiquetaCombo(c)}</a>`).join('')}</div>` : ''}
@@ -600,10 +754,12 @@ function viewProgresoEj(id, q) {
     <div class="card">${chartSvg(pts, met)}</div>
     ${stats}
     ${est.length ? `<div class="banner ${est.some((t) => +t.split(': ')[1] >= 3) ? 'warn' : 'info'}">🔁 Sesiones iguales seguidas — ${est.join(' · ')}</div>` : ''}
+    ${m === 'Descarga' ? '<div class="banner descarga">🔋 Sesiones de descarga: se guardan aparte y no cuentan en tu progreso ni en las "sesiones igual".</div>' : ''}
     <h2>Sesiones</h2>
-    <div class="list">${list.slice().reverse().map((e) => `<div class="sess"><div class="date">${fmtDate(e.fecha)}</div>
-      <div class="grow">${chipsHtml(ex, e, true)}${e.nota ? `<div class="small muted" style="margin-top:4px">${esc(e.nota)}</div>` : ''}</div>
-      ${e.pendiente ? '<span title="Pendiente de enviar">⏳</span>' : ''}</div>`).join('')}</div>
+    <p class="small muted" style="margin:-4px 0 8px">Toca una sesión para corregirla, cambiarle la fecha o borrarla.</p>
+    <div class="list">${list.slice().reverse().map((e) => `<a class="sess" href="${esc(ejUrl(id, v, m, e.fecha, aqui))}"><div class="date">${fmtDate(e.fecha)}</div>
+      <div class="grow">${chipsHtml(ex, e, m !== 'Descarga')}${e.nota ? `<div class="small muted" style="margin-top:4px">${esc(e.nota)}</div>` : ''}</div>
+      ${e.pendiente ? '<span title="Pendiente de enviar">⏳</span>' : ''}<span class="muted">›</span></a>`).join('')}</div>
   </div>` + nav('progreso');
 }
 
@@ -638,10 +794,12 @@ function viewEditar(id, q) {
     }
     E = { ...base, _marca: marca, _isNew: isNew };
   }
+  E._volver = safeVolver(q.get('volver'));
+  const volver = E._volver || '#/ejercicios';
   const grupos = [...new Set(V.catalogo.map((e) => e.grupo).filter(Boolean))];
   const tiempo = E.medicion === 'Tiempo';
   const input = (f, lab, extra, help) => `<label class="lbl" for="e-${f}">${lab}</label><input id="e-${f}" type="text" data-e="${f}" value="${esc(E[f])}" ${extra || ''}>${help ? `<div class="help">${help}</div>` : ''}`;
-  return topbar(isNew ? 'Nuevo ejercicio' : 'Editar ejercicio', '#/ejercicios') + `<div class="wrap form">
+  return topbar(isNew ? 'Nuevo ejercicio' : 'Editar ejercicio', volver) + `<div class="wrap form">
     <label class="lbl" for="e-dia">Día</label>
     <select id="e-dia" data-e="dia">
       ${V.allDays.map((d) => `<option value="${esc(d)}" ${!E._diaNuevo && E.dia === d ? 'selected' : ''}>${esc(d)}</option>`).join('')}
@@ -664,14 +822,16 @@ function viewEditar(id, q) {
     ${input('nota', 'Nota (opcional)')}
     <label class="check"><input type="checkbox" data-e="activo" ${E.activo !== 'No' ? 'checked' : ''}> Activo (si lo desactivas, se oculta pero conserva su historial)</label>
   </div>
-  <div class="footer-bar"><div><a class="btn" href="#/ejercicios">Cancelar</a><button class="btn primary block" data-act="saveEx">Guardar</button></div></div>`;
+  <div class="footer-bar"><div><a class="btn" href="${esc(volver)}">Cancelar</a><button class="btn primary block" data-act="saveEx">Guardar</button></div></div>`;
 }
 
 function viewAjustes() {
   const fallidos = S.failed.map((f, i) => `<div><div class="grow"><div class="name">${esc(f.op.type === 'entry' ? `${fmtDate(f.op.fecha)} · ${f.op.ejercicio}` : f.op.type === 'exercise' ? `Ejercicio: ${f.op.ex.ejercicio}` : 'Borrado')}</div>
     <div class="small" style="color:var(--bad)">${esc(f.error)}</div></div>
     <button class="btn small" data-act="retryFailed" data-i="${i}">Reintentar</button><button class="btn small danger" data-act="dropFailed" data-i="${i}">Descartar</button></div>`).join('');
-  const pendientes = S.queue.map((op) => `<div><div class="grow small">${esc(op.type === 'entry' ? `${fmtDate(op.fecha)} · ${op.ejercicio}${op.variante === 'Suplente' ? ' (suplente)' : ''}${op.modo === 'Molestia' ? ' 🩹' : ''}` : op.type === 'exercise' ? `Ejercicio: ${op.ex.ejercicio}` : 'Eliminar registro ' + op.entrada.split('|')[0])}</div></div>`).join('');
+  const pendientes = S.queue.map((op) => `<div><div class="grow small">${esc(op.type === 'entry' ? `${fmtDate(op.fecha)} · ${op.ejercicio}${op.variante === 'Suplente' ? ' (suplente)' : ''}${MODO_ICONO[op.modo] ? ' ' + MODO_ICONO[op.modo] : ''}` : op.type === 'exercise' ? `Ejercicio: ${op.ex.ejercicio}` : 'Eliminar registro del ' + fmtDate(op.entrada.split('|')[0]))}</div></div>`).join('');
+  const vHoja = S.server && S.server.version ? String(S.server.version) : '';
+  const hojaVieja = vHoja && parseFloat(vHoja) < 1.1;
   return topbar('Ajustes') + `<div class="wrap form">
     ${pillHtml()}
     <h2>Conexión con tu hoja</h2>
@@ -686,6 +846,11 @@ function viewAjustes() {
     ${S.queue.length ? `<div class="list">${pendientes}</div><p class="help">Se envían solos cuando vuelve la señal. No borres los datos de la app mientras haya pendientes.</p>` : '<p class="small muted">Nada pendiente. Todo está en tu hoja.</p>'}
     ${S.failed.length ? `<h2>Con error (${S.failed.length})</h2><div class="list">${fallidos}</div>` : ''}
 
+    <h2>Semana de descarga</h2>
+    <label class="lbl" for="cfg-desc">En modo 🔋 Descarga, precargar los pesos al</label>
+    <select id="cfg-desc">${[40, 50, 55, 60, 65, 70, 75, 80].map((p) => `<option value="${p}" ${p === S.descargaPct ? 'selected' : ''}>${p}% de tu carga normal</option>`).join('')}</select>
+    <div class="help">Lo que guardes en modo Descarga queda aparte: no cuenta en tu progreso ni en las "sesiones igual".</div>
+
     <h2>Respaldo</h2>
     <p class="small muted">Descarga un archivo con todo lo que tiene el celular (incluye lo no enviado).</p>
     <button class="btn" data-act="exportar">Descargar respaldo</button>
@@ -696,7 +861,8 @@ function viewAjustes() {
 
     <h2>Avanzado</h2>
     <div class="row"><button class="btn small" data-act="update">Buscar actualización</button><button class="btn small danger" data-act="reset">Borrar datos del celular</button></div>
-    <p class="help">Versión ${APP_VERSION}</p>
+    <p class="help">Versión de la app ${APP_VERSION}${vHoja ? ' · hoja ' + esc(vHoja) : ''}</p>
+    ${hojaVieja ? '<div class="banner warn">Falta actualizar el script de tu hoja (Apps Script) a la versión 1.1. La app funciona igual, pero conviene hacerlo: mira la guía de actualización.</div>' : ''}
   </div>` + nav('ajustes');
 }
 
@@ -713,8 +879,8 @@ function render() {
   S.route = r;
   if (r.name !== 'ej') F = null;
   if (r.name !== 'editar') E = null;
-  document.body.classList.remove('molestia');
-  if (r.name === '' || r.name === 'dia') document.body.classList.toggle('molestia', S.modo === 'Molestia');
+  document.body.classList.remove('molestia', 'descarga');
+  if ((r.name === '' || r.name === 'dia') && modoClase(S.modo)) document.body.classList.add(modoClase(S.modo));
   document.body.classList.toggle('sin-nav', r.name === 'ej' || r.name === 'editar');
   let html;
   switch (r.name) {
@@ -754,7 +920,26 @@ const ACT = {
   modoGlobal(t) { S.modo = t.dataset.v; store(K.modo, S.modo); render(); },
   modoEj(t) {
     S.modo = t.dataset.v; store(K.modo, S.modo);
-    location.replace(`#/ej/${enc(F.exId)}?v=${F.variante}&m=${S.modo}&f=${F.fecha}`);
+    location.replace(ejUrl(F.exId, F.variante, S.modo, F.fecha, F.volver));
+  },
+  fechaHoy() { setFechaSesion(null); render(); },
+  addSup() { F.addSup = true; render(); const el = document.getElementById('sup-nombre'); if (el) el.focus(); },
+  cancelSup() { F.addSup = false; F.supNombre = ''; F.supAjuste = ''; render(); },
+  saveSup() {
+    const ex = view().byId.get(F.exId);
+    const nombre = String(F.supNombre || '').trim();
+    if (!nombre) return toast('Escribe el nombre del suplente', 'error');
+    const ajuste = num(F.supAjuste);
+    const exOp = {};
+    EX_FIELDS.forEach((f) => { exOp[f] = ex[f] === undefined || ex[f] === null ? '' : ex[f]; });
+    exOp.suplente = nombre;
+    exOp.ajuste = ajuste === null ? '' : ajuste;
+    if (!enqueue({ type: 'exercise', opId: uid(), ex: exOp })) return;
+    const { exId, modo, fecha, volver } = F;
+    F = null;
+    toast('Suplente agregado ✓');
+    location.replace(ejUrl(exId, 'Suplente', modo, fecha, volver));
+    sync();
   },
   step(t) {
     const i = +t.dataset.i, f = t.dataset.f, d = +t.dataset.d;
@@ -788,29 +973,48 @@ const ACT = {
     const series = F.series.map((s) => ({ reps: num(s.reps), peso: num(s.peso), tiempo: num(s.tiempo) }));
     while (series.length && isEmptySet(series[series.length - 1])) series.pop();
     if (!series.length) return toast('Carga al menos una serie', 'error');
-    const op = {
-      type: 'entry', opId: uid(), entrada: F.entrada, fecha: F.fecha, dia: ex.dia, exId: ex.id, ejercicio: label(ex),
+    // Las series migradas del Excel que no cambiaste conservan sus flechas y "sesiones igual"
+    if (F.existing) {
+      series.forEach((s, i) => {
+        const o = F.existing.series[i];
+        if (o && o.excel && o.reps === s.reps && o.peso === s.peso && o.tiempo === s.tiempo) {
+          s.excel = { tendReps: o.tr || '', tendPeso: o.tc || '', igual: o.igual };
+        }
+      });
+    }
+    // Mover a otra fecha = borrar el registro de la fecha vieja y guardarlo en la nueva (en un solo paso)
+    const destino = F.existing && esFecha(F.nuevaFecha) && F.nuevaFecha !== F.fecha ? F.nuevaFecha : F.fecha;
+    const ops = [];
+    if (destino !== F.fecha) {
+      if (destino > today()) return toast('No se puede mover a una fecha futura', 'error');
+      const choque = entryOn(ex.id, F.variante, F.modo, destino);
+      if (choque && !confirm(`Ya hay un registro de este ejercicio (${F.variante.toLowerCase()}, ${modoTxt(F.modo)}) el ${fmtDia(destino)}: ${choque.series.map((s) => setTxt(ex, s)).join(' · ')}.\n\n¿Reemplazarlo por este?`)) return;
+      ops.push({ type: 'deleteEntry', opId: uid(), entrada: F.entrada });
+    }
+    ops.push({
+      type: 'entry', opId: uid(), entrada: `${destino}|${ex.id}|${F.variante}|${F.modo}`, fecha: destino, dia: ex.dia, exId: ex.id, ejercicio: label(ex),
       ejecutado: ejecutado(ex, F.variante, F.modo), variante: F.variante, modo: F.modo, series, nota: (F.nota || '').trim(), ts: Date.now()
-    };
-    if (!enqueue(op)) return;
+    });
+    if (!enqueue(...ops)) return;
     delete S.drafts[F.entrada]; store(K.drafts, S.drafts);
+    tocarFechaSesion(F.fecha);
+    const movido = destino !== F.fecha;
+    const volver = F.volver;
     F = null;
-    toast(navigator.onLine ? 'Guardado ✓' : 'Guardado en el celular ✓ Se envía cuando haya señal');
-    location.hash = `#/dia/${enc(ex.dia)}`;
+    toast(movido ? `Movido al ${fmtDia(destino)} ✓` : navigator.onLine ? 'Guardado ✓' : 'Guardado en el celular ✓ Se envía cuando haya señal');
+    location.hash = volver || `#/dia/${enc(ex.dia)}`;
     sync();
   },
   delEntry() {
-    if (!confirm('¿Eliminar el registro de este ejercicio en esta fecha?')) return;
+    if (!confirm(`¿Eliminar el registro de este ejercicio del ${fmtDia(F.fecha)}?`)) return;
     const entrada = F.entrada;
-    const enServidor = (S.server.historial || []).some((e) => e.entrada === entrada);
-    S.queue = S.queue.filter((o) => !((o.type === 'entry' || o.type === 'deleteEntry') && o.entrada === entrada));
-    if (enServidor) S.queue.push({ type: 'deleteEntry', opId: uid(), entrada });
-    store(K.queue, S.queue); invalidate();
+    if (!enqueue({ type: 'deleteEntry', opId: uid(), entrada })) return;
     delete S.drafts[entrada]; store(K.drafts, S.drafts);
     const dia = view().byId.get(F.exId).dia;
+    const volver = F.volver;
     F = null;
     toast('Registro eliminado');
-    location.hash = `#/dia/${enc(dia)}`;
+    location.hash = volver || `#/dia/${enc(dia)}`;
     sync();
   },
   saveEx() {
@@ -832,9 +1036,10 @@ const ACT = {
     ex.orden = orden;
     EX_FIELDS.forEach((f) => { if (ex[f] === undefined || ex[f] === null) ex[f] = ''; });
     if (!enqueue({ type: 'exercise', opId: uid(), ex })) return;
+    const volver = E._volver;
     E = null;
     toast('Ejercicio guardado ✓');
-    location.hash = '#/ejercicios';
+    location.hash = volver || '#/ejercicios';
     sync();
   },
   async saveCfg() {
@@ -847,7 +1052,7 @@ const ACT = {
     store(K.cfg, S.cfg);
     toast('Probando conexión…');
     try {
-      await api('GET', { action: 'ping' });
+      await api({ action: 'ping' });
       toast('Conexión OK ✓');
       S.sync.error = null;
       sync();
@@ -878,7 +1083,20 @@ const ACT = {
     S.failed.splice(+t.dataset.i, 1); store(K.failed, S.failed); render();
   },
   async update() {
-    try { const reg = await navigator.serviceWorker?.getRegistration(); if (reg) await reg.update(); } catch (e) { /* sin señal */ }
+    toast('Buscando actualización…');
+    try {
+      const reg = await navigator.serviceWorker?.getRegistration();
+      if (reg) {
+        await reg.update();
+        // Si hay una versión nueva, se espera a que quede activa antes de recargar (máx. 10 s)
+        if (reg.installing || reg.waiting) {
+          await new Promise((res) => {
+            navigator.serviceWorker.addEventListener('controllerchange', res, { once: true });
+            setTimeout(res, 10000);
+          });
+        }
+      }
+    } catch (e) { /* sin señal */ }
     location.reload();
   },
   reset() {
@@ -911,14 +1129,33 @@ document.addEventListener('input', (e) => {
     afterSerieChange(view().byId.get(F.exId), +t.dataset.i);
   } else if (t.id === 'nota' && F) {
     F.nota = t.value; saveDraft();
+  } else if (t.id === 'sup-nombre' && F) {
+    F.supNombre = t.value;
+  } else if (t.id === 'sup-ajuste' && F) {
+    F.supAjuste = t.value;
   } else if (t.dataset.e && E && t.type !== 'checkbox' && t.tagName !== 'SELECT') {
     E[t.dataset.e] = t.value;
   }
 });
 document.addEventListener('change', (e) => {
   const t = e.target;
-  if (t.id === 'fecha' && F && /^\d{4}-\d{2}-\d{2}$/.test(t.value)) {
-    location.replace(`#/ej/${enc(F.exId)}?v=${F.variante}&m=${F.modo}&f=${t.value}`);
+  if (t.id === 'fechaSesion') {
+    if (t.value && !esFecha(t.value)) return;
+    if (t.value > today()) { toast('No se puede elegir una fecha futura', 'error'); t.value = fechaSesion(); return; }
+    setFechaSesion(t.value || null);
+    render();
+  } else if (t.id === 'fecha' && F && F.existing) {
+    // Solo se marca: el registro se mueve recién al tocar "Guardar y mover"
+    if (t.value > today()) { toast('No se puede mover a una fecha futura', 'error'); t.value = F.nuevaFecha || F.fecha; return; }
+    F.nuevaFecha = esFecha(t.value) && t.value !== F.fecha ? t.value : null;
+    const help = document.getElementById('fecha-help');
+    if (help) help.innerHTML = fechaHelp(F.fecha);
+    const btn = document.querySelector('[data-act="saveEj"]');
+    if (btn) btn.textContent = F.nuevaFecha ? 'Guardar y mover' : 'Guardar cambios';
+  } else if (t.id === 'cfg-desc') {
+    S.descargaPct = Number(t.value) || 60;
+    store(K.descarga, S.descargaPct);
+    toast(`Descarga al ${S.descargaPct}% ✓`);
   } else if (t.dataset.e && E) {
     if (t.type === 'checkbox') { E.activo = t.checked ? 'Sí' : 'No'; return; }
     if (t.dataset.e === 'dia' && t.tagName === 'SELECT') {

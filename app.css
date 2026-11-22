@@ -14,6 +14,8 @@
   --bad: #b91c1c;
   --bad-bg: #fee2e2;
   --molestia: #ea580c;
+  --descarga: #0f766e;
+  --descarga-bg: #ccfbf1;
   --radius: 14px;
   --shadow: 0 1px 2px rgba(0, 0, 0, .06), 0 1px 8px rgba(0, 0, 0, .04);
   --nav-h: 64px;
@@ -36,6 +38,8 @@
     --bad: #f87171;
     --bad-bg: #3b1212;
     --molestia: #fb923c;
+    --descarga: #2dd4bf;
+    --descarga-bg: #0d2f2c;
     --shadow: none;
     color-scheme: dark;
   }
@@ -43,7 +47,7 @@
 :root[data-theme="dark"] {
   --bg: #0f1115; --surface: #181b21; --surface-2: #22262e; --text: #f3f4f6; --muted: #9ca3af; --line: #2b3038;
   --accent: #60a5fa; --accent-text: #0b1220; --ok: #4ade80; --ok-bg: #12301d; --warn: #fbbf24; --warn-bg: #3a2a08;
-  --bad: #f87171; --bad-bg: #3b1212; --molestia: #fb923c; --shadow: none; color-scheme: dark;
+  --bad: #f87171; --bad-bg: #3b1212; --molestia: #fb923c; --descarga: #2dd4bf; --descarga-bg: #0d2f2c; --shadow: none; color-scheme: dark;
 }
 
 * { box-sizing: border-box; }
@@ -58,6 +62,7 @@ body {
 }
 body.sin-nav { padding-bottom: calc(96px + env(safe-area-inset-bottom)); }
 body.molestia { --accent: var(--molestia); }
+body.descarga { --accent: var(--descarga); }
 a { color: inherit; text-decoration: none; }
 button, input, select, textarea { font: inherit; color: inherit; }
 button { cursor: pointer; }
@@ -104,8 +109,22 @@ h2 { font-size: 15px; text-transform: uppercase; letter-spacing: .04em; color: v
 }
 .seg .on { background: var(--surface); color: var(--text); box-shadow: var(--shadow); }
 .seg .on.molestia { color: var(--molestia); }
+.seg .on.descarga { color: var(--descarga); }
 .seg small { display: block; font-weight: 400; font-size: 12px; }
 .seg.grid2 { display: grid; grid-template-columns: 1fr 1fr; }
+.seg.modos button { padding: 10px 4px; font-size: 15px; }
+
+/* Fecha del entrenamiento */
+.fecha-bar {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 8px 10px;
+  background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 8px 12px; font-size: 14px;
+}
+.fecha-bar label { flex: 1 1 150px; }
+.fecha-bar input[type="date"] { width: 150px; flex: none; padding: 8px 10px; min-height: 40px; }
+.fecha-bar.pasada { background: var(--warn-bg); color: var(--warn); border-color: transparent; }
+.fecha-ej { font-size: 14px; font-weight: 600; color: var(--muted); }
+.fecha-ej.pasada { color: var(--warn); }
+.grow { flex: 1; min-width: 0; }
 
 /* Tarjetas */
 .card {
@@ -137,6 +156,7 @@ a.card:active { transform: scale(.99); }
 .banner.warn { background: var(--warn-bg); color: var(--warn); }
 .banner.molestia { background: var(--warn-bg); color: var(--molestia); font-weight: 600; }
 .banner.info { background: var(--surface-2); color: var(--muted); }
+.banner.descarga { background: var(--descarga-bg); color: var(--descarga); font-weight: 600; }
 
 /* Botones */
 .btn {
@@ -149,6 +169,8 @@ a.card:active { transform: scale(.99); }
 .btn.block { width: 100%; }
 .btn.small { min-height: 38px; padding: 0 12px; font-size: 14px; }
 .linkbtn { background: none; border: 0; color: var(--bad); font-size: 14px; padding: 8px 0; text-decoration: underline; }
+.linkbtn.plain { color: var(--accent); text-decoration: none; font-weight: 600; text-align: left; }
+a.sess:active { background: var(--surface-2); }
 
 /* Formulario de series */
 .serie {
